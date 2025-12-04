@@ -78,10 +78,11 @@ def save_reconstruction(droid, save_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--imagedir", type=str, help="path to image directory")
-    parser.add_argument("--calib", type=str, help="path to calibration file")
+    parser.add_argument("--imagedir", type=str, default="/home/lbg030/Documents/Dataset/Replica/orig/Replica/office0/images", help="path to image directory")
+    parser.add_argument("--calib", type=str, default="/home/lbg030/Desktop/slam/da3-slam/calib/replica.txt", help="path to calibration file")
     parser.add_argument("--t0", default=0, type=int, help="starting frame")
-    parser.add_argument("--stride", default=3, type=int, help="frame stride")
+    parser.add_argument("--stride", default=1, type=int, help="frame stride")
+    parser.add_argument("--da3_weights", type=str, help="path to DA3 model weights")
 
     parser.add_argument("--weights", default="droid.pth")
     parser.add_argument("--buffer", type=int, default=512)
@@ -104,7 +105,11 @@ if __name__ == '__main__':
     parser.add_argument("--asynchronous", action="store_true")
     parser.add_argument("--frontend_device", type=str, default="cuda")
     parser.add_argument("--backend_device", type=str, default="cuda")
-    
+
+    # DA3 Fusion arguments
+    # parser.add_argument("--use_da3_fusion", action="store_true", help="Enable DA3 fusion for improved depth and pose estimation")
+    parser.add_argument("--use_da3_fusion", action="store_true", default=True, help="Enable DA3 fusion for improved depth and pose estimation")
+
     parser.add_argument("--reconstruction_path", help="path to saved reconstruction")
     args = parser.parse_args()
 

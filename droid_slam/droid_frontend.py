@@ -7,11 +7,20 @@ from factor_graph import FactorGraph
 
 from cuda_timer import CudaTimer
 
+# DA3 Fusion imports
+from da3_fusion import (
+    KeyframeDA3Manager,
+    MultiViewScaleConsensus,
+    DepthGuidedPoseRefiner,
+    inject_depth_prior_to_video,
+    DA3FeatureMatcher
+)
+
 
 ENABLE_TIMING = False
 
 class DroidFrontend:
-    def __init__(self, net, video, args):
+    def __init__(self, net, video, args, da3_model=None):
         self.video = video
         self.update_op = net.update
         self.graph = FactorGraph(
@@ -45,6 +54,17 @@ class DroidFrontend:
         self.motion_damping = 0.0
         if hasattr(args, "motion_damping"):
             self.motion_damping = args.motion_damping
+
+        # DA3 Fusion components
+        self.use_da3_fusion = da3_model is not None and hasattr(args, 'use_da3_fusion') and args.use_da3_fusion
+        if self.use_da3_fusion:
+            print("[DA3-Fusion] Initializing DA3 fusion components...")
+            self.da3_manager = KeyframeDA3Manager(da3_model, video)
+            self.scale_consensus = MultiViewScaleConsensus()
+            self.pose_refiner = DepthGuidedPoseRefiner(video)
+            self.feature_matcher = DA3FeatureMatcher()
+            self.current_scale = 1.0
+            print("[DA3-Fusion] Initialization complete!")
 
     def _init_next_state(self):
         # set pose / depth for next iteration
@@ -81,6 +101,14 @@ class DroidFrontend:
             remove=True,
         )
 
+        # DA3 Fusion: Check if we should run DA3 on this keyframe
+        if self.use_da3_fusion and self.da3_manager.should_run_da3(self.t1 - 1, self.graph):
+            self.da3_manager.run_da3_async(self.t1 - 1)
+
+        # DA3 Fusion: Process available DA3 data
+        if self.use_da3_fusion:
+            self._fuse_da3_data()
+
         self.video.disps[self.t1 - 1] = torch.where(
             self.video.disps_sens[self.t1 - 1] > 0,
             self.video.disps_sens[self.t1 - 1],
@@ -115,6 +143,73 @@ class DroidFrontend:
 
         # update visualization
         self.video.dirty[self.graph.ii.min() : self.t1] = True
+
+    def _fuse_da3_data(self):
+        """Process available DA3 data and fuse with DROID"""
+        # Collect frames with DA3 data
+        available_frames = []
+        for idx in range(max(0, self.t1 - 20), self.t1):
+            if self.da3_manager.has_data(idx):
+                available_frames.append(idx)
+
+        if len(available_frames) < 3:
+            return  # Need at least 3 frames for scale consensus
+
+        # Get recent frames for scale estimation
+        recent_frames = available_frames[-min(5, len(available_frames)):]
+
+        try:
+            # Extract poses
+            da3_poses = []
+            droid_poses = []
+            for idx in recent_frames:
+                da3_data = self.da3_manager.get_data(idx)
+                if da3_data is not None and da3_data['pose'] is not None:
+                    da3_poses.append(da3_data['pose'])
+                    droid_poses.append(self.video.poses[idx])
+
+            # Estimate scale if we have DA3 poses
+            if len(da3_poses) >= 2:
+                self.current_scale = self.scale_consensus.estimate_scale(
+                    da3_poses, droid_poses, recent_frames
+                )
+
+            # Inject depth priors for available frames
+            for idx in available_frames:
+                da3_data = self.da3_manager.get_data(idx)
+                if da3_data is not None:
+                    try:
+                        # Inject high-confidence depth as prior
+                        inject_depth_prior_to_video(
+                            self.video,
+                            idx,
+                            da3_data['depth'],
+                            da3_data['conf'],
+                            self.current_scale,
+                            conf_threshold=0.7
+                        )
+
+                        # Add DA3 features for loop closure
+                        if len(da3_data['feats']) > 0:
+                            self.feature_matcher.add_features(idx, da3_data['feats'])
+
+                    except Exception as e:
+                        print(f"[DA3-Fusion] Warning: Failed to inject depth for frame {idx}: {e}")
+
+            # Loop closure detection (every 10 frames)
+            if self.count % 10 == 0 and len(available_frames) > 0:
+                current_idx = available_frames[-1]
+                loop_candidates = self.feature_matcher.find_loop_closures(current_idx)
+
+                if len(loop_candidates) > 0:
+                    print(f"[DA3-Fusion] Found {len(loop_candidates)} loop closure candidates for frame {current_idx}")
+                    # Note: Adding loop edges directly in factor graph can be unstable
+                    # For now, just detect and log. Can be enabled for backend optimization.
+
+        except Exception as e:
+            print(f"[DA3-Fusion] Error in fusion: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _initialize(self):
         """initialize the SLAM system"""

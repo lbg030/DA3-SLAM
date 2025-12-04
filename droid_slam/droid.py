@@ -12,6 +12,7 @@ from trajectory_filler import PoseTrajectoryFiller
 from collections import OrderedDict
 from torch.multiprocessing import Process
 
+from depth_anything_3.api import DepthAnything3
 
 class Droid:
     def __init__(self, args):
@@ -19,6 +20,10 @@ class Droid:
         self.load_weights(args.weights)
         self.args = args
         self.disable_vis = args.disable_vis
+        
+        
+        self.da3_model = DepthAnything3.from_pretrained("depth-anything/da3-large")
+        self.da3_model = self.da3_model.to(args.frontend_device).eval()
 
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(args.image_size, args.buffer, stereo=args.stereo)
@@ -26,8 +31,8 @@ class Droid:
         # filter incoming frames so that there is enough motion
         self.filterx = MotionFilter(self.net, self.video, thresh=args.filter_thresh)
 
-        # frontend process
-        self.frontend = DroidFrontend(self.net, self.video, self.args)
+        # frontend process (with DA3 fusion)
+        self.frontend = DroidFrontend(self.net, self.video, self.args, da3_model=self.da3_model)
         
         # backend process
         self.backend = DroidBackend(self.net, self.video, self.args)
