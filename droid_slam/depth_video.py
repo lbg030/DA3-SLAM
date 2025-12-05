@@ -29,6 +29,12 @@ class DepthVideo:
         self.disps_up = torch.zeros(buffer, ht, wd, device=device, dtype=torch.float).share_memory_()
         self.intrinsics = torch.zeros(buffer, 4, device=device, dtype=torch.float).share_memory_()
 
+        # DA3 depth and confidence (for visualization and optimization)
+        self.da3_depths = torch.zeros(buffer, ht//4, wd//4, device=device, dtype=torch.float).share_memory_()
+        self.da3_confs = torch.zeros(buffer, ht//4, wd//4, device=device, dtype=torch.float).share_memory_()
+        self.da3_scale = torch.ones(1, device=device, dtype=torch.float).share_memory_()
+        self.da3_shift = torch.zeros(1, device=device, dtype=torch.float).share_memory_()
+
         self.stereo = stereo
         c = 1 if not self.stereo else 2
 
@@ -51,6 +57,11 @@ class DepthVideo:
         self.disps_up = self.disps_up.to(device=device)
         self.intrinsics = self.intrinsics.to(device=device)
 
+        self.da3_depths = self.da3_depths.to(device=device)
+        self.da3_confs = self.da3_confs.to(device=device)
+        self.da3_scale = self.da3_scale.to(device=device)
+        self.da3_shift = self.da3_shift.to(device=device)
+
         self.fmaps = self.fmaps.to(device=device)
         self.nets = self.nets.to(device=device)
         self.inps = self.inps.to(device=device)
@@ -68,6 +79,10 @@ class DepthVideo:
         del self.disps_sens
         del self.disps_up
         del self.intrinsics
+        del self.da3_depths
+        del self.da3_confs
+        del self.da3_scale
+        del self.da3_shift
         del self.fmaps
         del self.nets
         del self.inps

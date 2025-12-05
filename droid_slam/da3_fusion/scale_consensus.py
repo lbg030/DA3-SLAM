@@ -82,9 +82,16 @@ class MultiViewScaleConsensus:
                 T_droid_j = SE3(droid_poses[j:j+1])
                 T_droid_rel = T_droid_i.inv() * T_droid_j
 
+                # Extract translation from 4x4 matrix
+                T_da3_mat = T_da3_rel.matrix()[0]  # [4, 4]
+                T_droid_mat = T_droid_rel.matrix()[0]  # [4, 4]
+
+                t_da3_vec = T_da3_mat[:3, 3]  # [3]
+                t_droid_vec = T_droid_mat[:3, 3]  # [3]
+
                 # Translation magnitudes
-                t_da3 = T_da3_rel.translation().norm()
-                t_droid = T_droid_rel.translation().norm()
+                t_da3 = t_da3_vec.norm()
+                t_droid = t_droid_vec.norm()
 
                 # Only use if sufficient motion
                 if t_da3 > self.min_motion_thresh and t_droid > self.min_motion_thresh:
@@ -93,10 +100,12 @@ class MultiViewScaleConsensus:
 
                     # Confidence from rotation consistency
                     # If rotations agree, poses are more reliable
-                    R_da3 = T_da3_rel.rotation()
-                    R_droid = T_droid_rel.rotation()
-                    R_diff = R_droid * R_da3.inv()
-                    rot_error = R_diff.log().norm()
+                    R_da3 = T_da3_mat[:3, :3]  # [3, 3]
+                    R_droid = T_droid_mat[:3, :3]  # [3, 3]
+
+                    # Compute rotation error using Frobenius norm
+                    R_diff = R_droid @ R_da3.T  # Should be close to identity if consistent
+                    rot_error = (R_diff - torch.eye(3, device=R_diff.device, dtype=R_diff.dtype)).norm()
 
                     # Exponential decay with rotation error
                     conf = torch.exp(-2.0 * rot_error)

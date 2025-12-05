@@ -7,10 +7,17 @@ import droid_backends
 import moderngl_window
 import moderngl
 from moderngl_window.opengl.vao import VAO
+import torch.nn.functional as F
 
 import numpy as np
 from .camera import OrbitDragCameraWindow
 from align import align_pose_fragements
+
+# DA3 projection operations
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from da3_fusion.da3_projection import iproj_depth, depth_filter_multiview
 
 CAM_POINTS = 0.05 * np.array(
     [
@@ -143,7 +150,11 @@ class DroidVisualizer(OrbitDragCameraWindow):
         )
 
         n, h, w = self._depth_video1.disps.shape
-        max_num_points = n * h * w
+
+        # Allocate buffer for maximum possible size (DA3 at 240x320 or DROID at h*w)
+        # Use larger dimension to avoid overflow
+        max_h, max_w = max(h, 240), max(w, 320)
+        max_num_points = n * max_h * max_w
 
         # Upload buffer to GPU
         valid = np.zeros((max_num_points,), dtype="f4")
@@ -153,6 +164,8 @@ class DroidVisualizer(OrbitDragCameraWindow):
         self.valid_buffer = self.ctx.buffer(valid.tobytes())
         self.pts_buffer = self.ctx.buffer(points.tobytes())
         self.clr_buffer = self.ctx.buffer(colors.tobytes())
+
+        self.max_num_points = max_num_points  # Store for safety checks
 
         self.vao = VAO("geometry_frustrum", mode=moderngl.LINES)
         self.cam_prog["color"].value = (0, 0, 0)
@@ -210,7 +223,6 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 poses = poses[:t]
                 disps = disps[:t]
             else:
-                disps = self._depth_video1.disps[:t]
                 poses = self._depth_video1.poses[:t]
 
             # 4x4 homogenous matrix
@@ -220,23 +232,128 @@ class DroidVisualizer(OrbitDragCameraWindow):
 
             self.cam_buffer.write(cam_pts)
 
-            index = torch.arange(t, device="cuda")
-            thresh = self._filter_threshold * torch.ones_like(disps.mean(dim=[1, 2]))
+            # Check if DA3 depth is available and use it for point cloud
+            use_da3 = (self._depth_video1.da3_depths[:t].abs().sum() > 0)
 
-            points = droid_backends.iproj(SE3(poses).inv().data, disps, intrinsics[0])
-            colors = images[:, [2, 1, 0]].permute(0, 2, 3, 1) / 255.0
+            if use_da3:
+                # Use DA3 depth for point cloud generation (Professor-level approach)
+                # CRITICAL: Depths are ALREADY aligned per-frame in frontend!
+                # Do NOT apply global scale/shift here - it defeats per-frame alignment
+                depths_aligned = self._depth_video1.da3_depths[:t]
+                da3_confs = self._depth_video1.da3_confs[:t]
 
-            counts = droid_backends.depth_filter(
-                poses, disps, intrinsics[0], index, thresh
-            )
-            mask = (counts >= self._filter_count) & (disps > 0.25 * disps.mean())
+                # Clamp to reasonable range
+                depths_aligned = torch.clamp(depths_aligned, min=0.2, max=100.0)
 
-            valid = mask.float()
+                # CRITICAL: intrinsics[0] is for 1/8 resolution images (ht//8, wd//8)
+                # da3_depths is at 1/4 resolution (ht//4, wd//4)
+                # We need to scale intrinsics: 1/8 -> 1/4 -> target resolution
+
+                # Step 1: Scale from 1/8 to 1/4 resolution (2x upscale)
+                intrinsics_at_quarter_res = intrinsics[0].clone()
+                intrinsics_at_quarter_res[0] *= 2.0  # fx
+                intrinsics_at_quarter_res[1] *= 2.0  # fy
+                intrinsics_at_quarter_res[2] *= 2.0  # cx
+                intrinsics_at_quarter_res[3] *= 2.0  # cy
+
+                # Downsample for performance (240x320 target)
+                H_target, W_target = 240, 320
+                H_da3, W_da3 = depths_aligned.shape[1], depths_aligned.shape[2]
+
+                if H_da3 != H_target or W_da3 != W_target:
+                    depths_aligned = F.interpolate(
+                        depths_aligned.unsqueeze(1),
+                        size=(H_target, W_target),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)
+                    da3_confs = F.interpolate(
+                        da3_confs.unsqueeze(1),
+                        size=(H_target, W_target),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)
+
+                    # Step 2: Scale from 1/4 resolution to target resolution
+                    scale_h = H_target / H_da3
+                    scale_w = W_target / W_da3
+                    intrinsics_scaled = intrinsics_at_quarter_res.clone()
+                    intrinsics_scaled[0] *= scale_w  # fx
+                    intrinsics_scaled[1] *= scale_h  # fy
+                    intrinsics_scaled[2] *= scale_w  # cx
+                    intrinsics_scaled[3] *= scale_h  # cy
+                else:
+                    intrinsics_scaled = intrinsics_at_quarter_res
+
+                # Multi-view depth filtering
+                index = torch.arange(t, device="cuda")
+                counts = depth_filter_multiview(
+                    poses, depths_aligned, da3_confs, intrinsics_scaled, index,
+                    reproj_thresh=0.08, conf_thresh=0.4, min_views=1
+                )
+
+                # Valid mask: high confidence and consistent
+                mask = (counts >= 1) & (da3_confs > 0.4) & (depths_aligned > 0.2)
+
+                # Inverse projection to 3D
+                points = iproj_depth(poses, depths_aligned, intrinsics_scaled, return_local=False)
+
+                # Flatten for rendering
+                points = points.reshape(t, -1, 3)  # [t, H*W, 3]
+
+                # Resize colors to match depth resolution
+                colors_full = self._depth_video1.images[:t].float()
+                colors_resized = F.interpolate(
+                    colors_full,
+                    size=(H_target, W_target),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                colors = colors_resized[:, [2, 1, 0]].permute(0, 2, 3, 1) / 255.0
+                colors = colors.reshape(t, -1, 3)
+
+                valid = mask.reshape(t, -1).float()
+
+                print(f"[Visualizer] Using DA3 depth (per-frame aligned): {t} frames, "
+                      f"valid={valid.sum().item():.0f}/{valid.numel():.0f} points")
+            else:
+                # Fallback to DROID disparity
+                disps = self._depth_video1.disps[:t]
+                index = torch.arange(t, device="cuda")
+                thresh = self._filter_threshold * torch.ones_like(disps.mean(dim=[1, 2]))
+
+                points = droid_backends.iproj(SE3(poses).inv().data, disps, intrinsics[0])
+                colors = images[:, [2, 1, 0]].permute(0, 2, 3, 1) / 255.0
+
+                counts = droid_backends.depth_filter(
+                    poses, disps, intrinsics[0], index, thresh
+                )
+                mask = (counts >= self._filter_count) & (disps > 0.25 * disps.mean())
+                valid = mask.float()
+
+            # Safety check: ensure data fits in buffer
+            points_flat = points.reshape(-1, 3)
+            colors_flat = colors.reshape(-1, 3)
+            valid_flat = valid.reshape(-1)
+
+            num_points = points_flat.shape[0]
+            if num_points > self.max_num_points:
+                print(f"[WARNING] Buffer overflow prevented: {num_points} > {self.max_num_points}")
+                # Truncate to fit
+                points_flat = points_flat[:self.max_num_points]
+                colors_flat = colors_flat[:self.max_num_points]
+                valid_flat = valid_flat[:self.max_num_points]
+            elif num_points < self.max_num_points:
+                # Pad with zeros
+                pad_size = self.max_num_points - num_points
+                points_flat = torch.cat([points_flat, torch.zeros(pad_size, 3, device=points_flat.device)])
+                colors_flat = torch.cat([colors_flat, torch.zeros(pad_size, 3, device=colors_flat.device)])
+                valid_flat = torch.cat([valid_flat, torch.zeros(pad_size, device=valid_flat.device)])
 
             # wasteful (gpu -> cpu -> gpu)
-            self.pts_buffer.write(points.contiguous().cpu().numpy())
-            self.clr_buffer.write(colors.contiguous().cpu().numpy())
-            self.valid_buffer.write(valid.contiguous().cpu().numpy())
+            self.pts_buffer.write(points_flat.contiguous().cpu().numpy())
+            self.clr_buffer.write(colors_flat.contiguous().cpu().numpy())
+            self.valid_buffer.write(valid_flat.contiguous().cpu().numpy())
 
         self.count += 1
         self.points.render(mode=moderngl.POINTS)

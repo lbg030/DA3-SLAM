@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import threading
 from collections import OrderedDict
 from lietorch import SE3
-
+from visualization_utils import show_plot
 
 def rotation_matrix_to_quaternion(R):
     """
@@ -62,16 +62,20 @@ class KeyframeDA3Manager:
     - Thread-safe access to cached results
     """
 
-    def __init__(self, da3_model, video, process_res=504):
+    def __init__(self, da3_model, video, process_res=504, use_multiview=True, multiview_window=5):
         """
         Args:
             da3_model: DepthAnything3 model instance
             video: DepthVideo instance from DROID
             process_res: Processing resolution for DA3
+            use_multiview: Whether to use multi-view DA3 with DROID poses
+            multiview_window: Number of frames to use for multi-view context
         """
         self.da3 = da3_model
         self.video = video
         self.process_res = process_res
+        self.use_multiview = use_multiview
+        self.multiview_window = multiview_window
 
         # Cache: {frame_idx: dict with depth, conf, pose, feats}
         self.cache = OrderedDict()
@@ -84,6 +88,15 @@ class KeyframeDA3Manager:
         # Feature layers to extract (ViT-L: 24 layers total)
         # Extract from late layers for semantic understanding
         self.feature_layers = [11, 17, 23]  # Early, mid, late features
+
+        # Multi-view DA3 engine (professor-level: use DROID poses for geometric context)
+        if self.use_multiview:
+            from da3_fusion.multiview_da3 import MultiViewDA3Inference
+            self.multiview_engine = MultiViewDA3Inference(
+                da3_model=da3_model,
+                window_size=multiview_window
+            )
+            print(f"[KeyframeManager] Multi-view DA3 enabled with window={multiview_window}")
 
     def should_run_da3(self, frame_idx, graph):
         """
@@ -136,6 +149,7 @@ class KeyframeDA3Manager:
     def _run_da3_sync(self, frame_idx):
         """
         Actual DA3 inference (runs in separate thread).
+        Uses multi-view DA3 with DROID poses if enabled (professor-level approach).
 
         Args:
             frame_idx: Frame index to process
@@ -147,93 +161,114 @@ class KeyframeDA3Manager:
             self.processing.add(frame_idx)
 
         try:
-            # Get image from video buffer
-            with self.video.get_lock():
-                image = self.video.images[frame_idx].clone()  # [3, H, W]
-
-            # Prepare for DA3 (expects [B, N, 3, H, W])
-            H, W = image.shape[-2:]
-            image_input = image[None, None].float()  # [1, 1, 3, H, W]
-
-            # Resize to process_res if needed
-            if H != self.process_res or W != self.process_res:
-                image_input = F.interpolate(
-                    image_input.squeeze(1),  # [1, 3, H, W]
-                    size=(self.process_res, self.process_res),
-                    mode='bilinear',
-                    align_corners=False
-                ).unsqueeze(1)  # [1, 1, 3, process_res, process_res]
-
-            # Run DA3 inference
-            with torch.no_grad():
-                output = self.da3.forward(
-                    image_input,
-                    extrinsics=None,
-                    intrinsics=None,
-                    export_feat_layers=self.feature_layers,
-                    infer_gs=False  # Don't need 3DGS
+            # PROFESSOR-LEVEL: Use multi-view DA3 with DROID geometric context
+            if self.use_multiview:
+                # Multi-view inference provides multiple frames with extrinsics/intrinsics
+                output = self.multiview_engine.infer(
+                    frame_idx,
+                    self.video,
+                    return_features=True
                 )
 
-            # Extract depth and confidence
-            depth_raw = output['depth'][0, 0]  # [process_res, process_res]
-            conf_raw = output.get('depth_conf', None)
-            if conf_raw is not None:
-                conf_raw = conf_raw[0, 0]  # [process_res, process_res]
+                if output is None:
+                    # Not enough context yet, skip
+                    return
+
+                # Extract depth and confidence for the target frame
+                depth = output['depth']  # Already at correct resolution
+                conf = output['confidence']
+                pose_da3 = None  # Multi-view doesn't return single pose
+                feats = output.get('features', {})
+                H, W = depth.shape
+
             else:
-                # If no confidence, use uniform
-                conf_raw = torch.ones_like(depth_raw)
+                # FALLBACK: Single-view DA3 (original undergraduate approach)
+                # Get image from video buffer
+                with self.video.get_lock():
+                    image = self.video.images[frame_idx].clone()  # [3, H, W]
 
-            # Resize back to original resolution
-            depth = F.interpolate(
-                depth_raw[None, None],
-                size=(H, W),
-                mode='bilinear',
-                align_corners=False
-            )[0, 0]
+                # Prepare for DA3 (expects [B, N, 3, H, W])
+                H, W = image.shape[-2:]
+                image_input = image[None, None].float()  # [1, 1, 3, H, W]
 
-            conf = F.interpolate(
-                conf_raw[None, None],
-                size=(H, W),
-                mode='bilinear',
-                align_corners=False
-            )[0, 0]
+                # Resize to process_res if needed
+                if H != self.process_res or W != self.process_res:
+                    image_input = F.interpolate(
+                        image_input.squeeze(1),  # [1, 3, H, W]
+                        size=(self.process_res, self.process_res),
+                        mode='bilinear',
+                        align_corners=False
+                    ).unsqueeze(1)  # [1, 1, 3, process_res, process_res]
 
-            # Extract pose if available
-            pose_da3 = None
-            if 'extrinsics' in output and output['extrinsics'] is not None:
-                # DA3 may return either a 4x4 homogeneous extrinsic or a 3x4 [R|t].
-                # Normalize to a 4x4 matrix before inversion.
-                ext = output['extrinsics'][0, 0]
+                # Run DA3 inference
+                with torch.no_grad():
+                    output = self.da3.forward(
+                        image_input / 255.0,
+                        extrinsics=None,
+                        intrinsics=None,
+                        export_feat_layers=self.feature_layers,
+                        infer_gs=False  # Don't need 3DGS
+                    )
 
-                # If DA3 returned a 3x4 [R|t], convert to 4x4 homogeneous matrix.
-                if ext.ndim == 2 and ext.shape[0] == 3 and ext.shape[1] == 4:
-                    ext4 = torch.eye(4, device=ext.device, dtype=ext.dtype)
-                    ext4[:3, :4] = ext
-                    ext = ext4
-
-                # If shape is now 4x4, invert to get camera-to-world (c2w).
-                if ext.ndim == 2 and ext.shape[0] == 4 and ext.shape[1] == 4:
-                    c2w = torch.linalg.inv(ext)
-                    # Extract rotation and translation
-                    R = c2w[:3, :3]
-                    t = c2w[:3, 3]
-                    # Convert rotation matrix to quaternion
-                    q = rotation_matrix_to_quaternion(R)
-                    # SE3 format: [tx, ty, tz, qw, qx, qy, qz]
-                    pose_da3 = torch.cat([t, q])
+                # Extract depth and confidence
+                depth_raw = output['depth'][0, 0]  # [process_res, process_res]
+                conf_raw = output.get('depth_conf', None)
+                if conf_raw is not None:
+                    conf_raw = conf_raw[0, 0]  # [process_res, process_res]
                 else:
-                    # Unexpected shape: skip pose extraction
-                    raise ValueError(f"Unexpected extrinsics shape from DA3: {ext.shape}")
-                    
+                    # If no confidence, use uniform
+                    conf_raw = torch.ones_like(depth_raw)
 
-            # Extract intermediate features
-            feats = {}
-            if 'aux' in output and output['aux'] is not None:
-                for key, val in output['aux'].items():
-                    if key.startswith('feat_layer_'):
-                        # Features shape: [1, 1, H/14, W/14, C]
-                        feat = val[0, 0]  # [H/14, W/14, C]
-                        feats[key] = feat
+                # Resize back to original resolution
+                depth = F.interpolate(
+                    depth_raw[None, None],
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False
+                )[0, 0]
+
+                conf = F.interpolate(
+                    conf_raw[None, None],
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False
+                )[0, 0]
+
+                # Extract pose if available
+                pose_da3 = None
+                if 'extrinsics' in output and output['extrinsics'] is not None:
+                    # DA3 may return either a 4x4 homogeneous extrinsic or a 3x4 [R|t].
+                    # Normalize to a 4x4 matrix before inversion.
+                    ext = output['extrinsics'][0, 0]
+
+                    # If DA3 returned a 3x4 [R|t], convert to 4x4 homogeneous matrix.
+                    if ext.ndim == 2 and ext.shape[0] == 3 and ext.shape[1] == 4:
+                        ext4 = torch.eye(4, device=ext.device, dtype=ext.dtype)
+                        ext4[:3, :4] = ext
+                        ext = ext4
+
+                    # If shape is now 4x4, invert to get camera-to-world (c2w).
+                    if ext.ndim == 2 and ext.shape[0] == 4 and ext.shape[1] == 4:
+                        c2w = torch.linalg.inv(ext)
+                        # Extract rotation and translation
+                        R = c2w[:3, :3]
+                        t = c2w[:3, 3]
+                        # Convert rotation matrix to quaternion
+                        q = rotation_matrix_to_quaternion(R)
+                        # SE3 format: [tx, ty, tz, qw, qx, qy, qz]
+                        pose_da3 = torch.cat([t, q])
+                    else:
+                        # Unexpected shape: skip pose extraction
+                        raise ValueError(f"Unexpected extrinsics shape from DA3: {ext.shape}")
+
+                # Extract intermediate features
+                feats = {}
+                if 'aux' in output and output['aux'] is not None:
+                    for key, val in output['aux'].items():
+                        if key.startswith('feat_layer_'):
+                            # Features shape: [1, 1, H/14, W/14, C]
+                            feat = val[0, 0]  # [H/14, W/14, C]
+                            feats[key] = feat
 
             # Store in cache
             with self.cache_lock:
