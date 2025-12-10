@@ -189,6 +189,12 @@ class FactorGraph:
         self.video.disps[ix : t - 1] = self.video.disps[ix + 1 : t].clone()
         self.video.disps_sens[ix : t - 1] = self.video.disps_sens[ix + 1 : t].clone()
         self.video.intrinsics[ix : t - 1] = self.video.intrinsics[ix + 1 : t].clone()
+        
+        # Mono
+        self.video.disps_mono[ix : t - 1] = self.video.disps_mono[ix + 1 : t].clone()
+        self.video.scales[ix : t - 1] = self.video.scales[ix + 1 : t].clone()
+        self.video.shifts[ix : t - 1] = self.video.shifts[ix + 1 : t].clone()
+        self.video.scale_confidence[ix : t - 1] = self.video.scale_confidence[ix + 1 : t].clone()
 
         self.video.nets[ix : t - 1] = self.video.nets[ix + 1 : t].clone()
         self.video.inps[ix : t - 1] = self.video.inps[ix + 1 : t].clone()

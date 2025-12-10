@@ -11,7 +11,7 @@ from trajectory_filler import PoseTrajectoryFiller
 
 from collections import OrderedDict
 from torch.multiprocessing import Process
-
+from depth_anything_v2.dpt import DepthAnythingV2
 
 class Droid:
     def __init__(self, args):
@@ -21,7 +21,7 @@ class Droid:
         self.disable_vis = args.disable_vis
 
         # store images, depth, poses, intrinsics (shared between processes)
-        self.video = DepthVideo(args.image_size, args.buffer, stereo=args.stereo)
+        self.video = DepthVideo(args.image_size, args.buffer, stereo=args.stereo, monocular_depth_enabled=True)
 
         # filter incoming frames so that there is enough motion
         self.filterx = MotionFilter(self.net, self.video, thresh=args.filter_thresh)
@@ -40,7 +40,7 @@ class Droid:
 
         # post processor - fill in poses for non-keyframes
         self.traj_filler = PoseTrajectoryFiller(self.net, self.video)
-
+            
 
     def load_weights(self, weights):
         """ load trained model weights """

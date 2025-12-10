@@ -10,7 +10,7 @@ from droid_net import cvx_upsample
 import geom.projective_ops as pops
 
 class DepthVideo:
-    def __init__(self, image_size=[480, 640], buffer=1024, stereo=False, device="cuda:0"):
+    def __init__(self, image_size=[480, 640], buffer=1024, stereo=False, monocular_depth_enabled=True, device="cuda:0"):
                 
         # current keyframe count
         self.counter = Value('i', 0)
@@ -39,6 +39,12 @@ class DepthVideo:
 
         # initialize poses to identity transformation
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=device)
+        
+        if monocular_depth_enabled:
+            self.disps_mono = torch.zeros(buffer, ht//8, wd//8, dtype=torch.float, device=device).share_memory_()
+            self.scales = torch.ones(buffer, dtype=torch.float, device=device).share_memory_()
+            self.shifts = torch.zeros(buffer, dtype=torch.float, device=device).share_memory_()
+            self.scale_confidence = torch.zeros(buffer, dtype=torch.float, device=device).share_memory_()
         
     def to(self, device="cuda"):
         self.tstamp = self.tstamp.to(device=device)

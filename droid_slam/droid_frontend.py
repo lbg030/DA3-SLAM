@@ -6,7 +6,10 @@ from lietorch import SE3
 from factor_graph import FactorGraph
 
 from cuda_timer import CudaTimer
+from depth_anything_v2.dpt import DepthAnythingV2
+from visualization_utils import *
 
+import torch.nn.functional as F
 
 ENABLE_TIMING = False
 
@@ -46,6 +49,21 @@ class DroidFrontend:
         if hasattr(args, "motion_damping"):
             self.motion_damping = args.motion_damping
 
+        if args.mono_weights is not None:
+            
+            model_configs = {
+                'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+                'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+            }
+            
+            self.mono_depth = DepthAnythingV2(**model_configs['vitl'])
+            self.mono_depth.load_state_dict(torch.load(args.mono_weights, map_location='cpu',
+                                    weights_only=True))
+            self.mono_depth.cuda().eval()
+
+        
     def _init_next_state(self):
         # set pose / depth for next iteration
         self.video.poses[self.t1] = self.video.poses[self.t1 - 1]
@@ -112,6 +130,10 @@ class DroidFrontend:
         self.video.disps[self.t1] = torch.quantile(
             self.video.disps[self.t1 - self.depth_window - 1 : self.t1 - 1], 0.7
         )
+        
+        with torch.no_grad():
+            self.infer_mono_depths()
+        
 
         # update visualization
         self.video.dirty[self.graph.ii.min() : self.t1] = True
@@ -149,6 +171,9 @@ class DroidFrontend:
             self.video.dirty[: self.t1] = True
 
         self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
+        
+        with torch.no_grad():
+            self.infer_mono_depths(init=True)
 
     def __call__(self):
         """main update"""
@@ -162,3 +187,22 @@ class DroidFrontend:
         elif self.is_initialized and self.t1 < self.video.counter.value:
             self._update()
             self._init_next_state()
+
+    def infer_mono_depths(self, init=False):
+        if init:
+            images = self.video.images[:self.t1] / 255.0 # N, 3(bgr), H, W
+        else:
+            images = self.video.images[self.t1 - 1 : self.t1] / 255.0 # 1, 3(bgr), H, W
+        #Convert bgr to rgb
+        images = images[:, [2, 1, 0], :, :]
+        # Normalize images
+        
+        mono_disps = self.mono_depth(images, ori_h = self.video.ht, ori_w = self.video.wd) # N, H, W
+        
+        # Downsample mono_disps to 1/8 resolution
+        #TODO: 나중에 Original 해상도로 Mapping 할 수 있도록 변경 -> 지금 downsample해서 정보 손실이 심함
+        downed_mono_disps = F.interpolate(mono_disps.unsqueeze(1), size=(self.video.ht//8, self.video.wd//8), mode='bilinear', align_corners=True).squeeze(1)
+        if init:
+            self.video.disps_mono[:self.t1] = downed_mono_disps
+        else:
+            self.video.disps_mono[self.t1 - 1] = downed_mono_disps
